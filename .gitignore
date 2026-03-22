@@ -13,7 +13,7 @@ obj/
 .python_packages/
 
 # IDE
-.vscode/
+
 *.swp
 *.swo
 

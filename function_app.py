@@ -73,7 +73,7 @@ def parse_schools(content: str) -> list:
 
 
 @app.function_name(name="ParseAffiliatedSchools")
-@app.route(route="parse-schools", methods=["POST"])
+@app.route(route="", methods=["POST"])
 def parse_affiliated_schools(req: func.HttpRequest) -> func.HttpResponse:
     """
     HTTP trigger called by Logic App after Document Intelligence runs.
