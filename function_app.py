@@ -1,73 +1,71 @@
 import azure.functions as func
 import json
-import re
 import logging
+from datetime import datetime
 
 app = func.FunctionApp()
 
-# Lines that are column headers or page markers — skip them
-SKIP_LINES = {
-    "Name of School and State",
-    "Operating units included on affiliation agreement listed below.",
-    "Expiration date",
-    "Programs",
-}
-PAGE_RE = re.compile(r"^Page \d+ of \d+$")
-DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
 
-
-def parse_schools(content: str) -> list:
+def parse_schools(analyze_result: dict) -> list:
     """
-    Parse the flat text from Document Intelligence.
+    Parse school rows from Document Intelligence structured table output.
 
-    The PDF repeats this 4-line block for every school:
-        Line 0: School name
-        Line 1: Operating units string
-        Line 2: Expiration date  (MM/DD/YYYY)  ← used as anchor
-        Line 3: Programs
+    The PDF has 2 tables (across 3 pages). Each table has 4 columns:
+        col 0: school_name
+        col 1: operating_units
+        col 2: expiration_date  (MM/DD/YYYY)
+        col 3: programs
 
-    Strategy: scan forward; when lines[i+2] matches the date pattern
-    then lines[i] is a school name. Advance by 4 and repeat.
+    Strategy: group cells by rowIndex, skip header rows (kind="columnHeader"),
+    build one dict per data row. This avoids fragile regex on flat text and
+    uses the structured output Document Intelligence already provides.
     """
-    lines = [ln.strip() for ln in content.split("\n") if ln.strip()]
-
+    tables = analyze_result.get("tables", [])
     schools = []
-    seen = set()  # deduplicate (the PDF lists Emory NHWSON twice)
-    i = 0
+    seen = set()
 
-    while i < len(lines):
-        line = lines[i]
+    for table_idx, table in enumerate(tables):
+        # Group cells by rowIndex → { rowIndex: { colIndex: content } }
+        rows = {}
+        for cell in table.get("cells", []):
+            if cell.get("kind") == "columnHeader":
+                continue                          # skip header row
+            r = cell["rowIndex"]
+            c = cell["columnIndex"]
+            rows.setdefault(r, {})[c] = cell.get("content", "").strip()
 
-        # Skip known header / page-break lines
-        if line in SKIP_LINES or PAGE_RE.match(line):
-            i += 1
-            continue
+        logging.info(f"Table {table_idx}: {len(rows)} data rows found.")
 
-        # Look-ahead: need at least 3 more lines
-        if i + 2 < len(lines) and DATE_RE.match(lines[i + 2]):
-            school_name = re.sub(r"\s+", " ", line).strip()
-            expiration_date = lines[i + 2]  # kept for logging; not in dim_school
-            programs = lines[i + 3] if i + 3 < len(lines) else None
+        for row_idx in sorted(rows):
+            cols = rows[row_idx]
+            school_name = cols.get(0, "").strip()
+            if not school_name:
+                continue
 
-            logging.info(
-                f"Found school: {school_name!r} | exp {expiration_date} | programs {programs!r}"
-            )
-
-            if school_name not in seen:
-                seen.add(school_name)
-                schools.append(
-                    {
-                        "school_name": school_name,
-                        "tier": None,        # not in source PDF — assign manually in Power BI or SQL
-                        "is_active": 1,
-                    }
-                )
-            else:
+            if school_name in seen:
                 logging.warning(f"Duplicate school skipped: {school_name!r}")
+                continue
+            seen.add(school_name)
 
-            i += 4
-        else:
-            i += 1
+            # Convert MM/DD/YYYY → YYYY-MM-DD for SQL DATE column
+            raw_date = cols.get(2, "")
+            try:
+                exp_date = datetime.strptime(raw_date, "%m/%d/%Y").strftime("%Y-%m-%d")
+            except ValueError:
+                exp_date = None
+                logging.warning(f"Could not parse date {raw_date!r} for {school_name!r}")
+
+            schools.append({
+                "school_name":    school_name,
+                "operating_units": cols.get(1) or None,
+                "expiration_date": exp_date,
+                "programs":        cols.get(3) or None,
+                "tier":            None,   # not in PDF — assign manually in SQL later
+                "is_active":       1,
+            })
+            logging.info(
+                f"  → {school_name!r} | units={cols.get(1)!r} | exp={exp_date} | programs={cols.get(3)!r}"
+            )
 
     return schools
 
@@ -78,14 +76,14 @@ def parse_affiliated_schools(req: func.HttpRequest) -> func.HttpResponse:
     """
     HTTP trigger called by Logic App after Document Intelligence runs.
 
-    Expected request body: the full Document Intelligence JSON
-    (the Logic App passes the Analyze Document output directly).
+    Expected body: the full Document Intelligence JSON response.
+    Logic App passes it directly from the 'Analyze Document' action output.
 
     Returns:
         { "table": "dim_school", "rows": [ { school fields... }, ... ] }
 
-    Logic App reads "table" to pick the SQL table and loops over "rows"
-    to insert one record per iteration using the SQL "Insert Row" action.
+    Logic App reads "table" to pick the SQL table, then loops over "rows"
+    to insert one record per school using the SQL connector Insert Row action.
     """
     logging.info("ParseAffiliatedSchools triggered.")
 
@@ -98,18 +96,18 @@ def parse_affiliated_schools(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
         )
 
-    # Accept either the full Document Intelligence response or a plain
-    # { "content": "..." } wrapper from a Compose step in Logic App
-    content = body.get("content") or body.get("analyzeResult", {}).get("content", "")
+    # Logic App passes the full Document Intelligence response.
+    # Handle both: raw DI response (has "analyzeResult") and plain wrapper.
+    analyze_result = body.get("analyzeResult", body)
 
-    if not content:
+    if not analyze_result.get("tables"):
         return func.HttpResponse(
-            json.dumps({"error": "No 'content' field found in request body"}),
+            json.dumps({"error": "No 'tables' found in analyzeResult. Ensure Document Intelligence used prebuilt-layout model."}),
             status_code=400,
             mimetype="application/json",
         )
 
-    rows = parse_schools(content)
+    rows = parse_schools(analyze_result)
     logging.info(f"Returning {len(rows)} dim_school rows.")
 
     return func.HttpResponse(
